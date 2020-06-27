@@ -64,6 +64,20 @@ say -v Anna "Oh weh! Das hat leider nicht geklappt!." -o 0401.aiff
 sox 0401.aiff 0401.wav pitch 800
 lame -b 128 0401.wav 0401_error.mp3
 
+say -v Anna "Soll wirklich zur nächsten Datei gewechselt werden? Bestätige innerhalb von 3 Sekunden mit erneutem Druck der Lautstärke Taste!" -o 0700.aiff
+sox 0700.aiff 0700.wav pitch 800
+lame -b 128 0700.wav 0700_skip_desired_forward.mp3
+
+say -v Anna "Soll wirklich zur vorherigen Datei gewechselt werden? Bestätige innerhalb von 3 Sekunden mit erneutem Druck der Lautstärke Taste!" -o 0701.aiff
+sox 0701.aiff 0701.wav pitch 800
+lame -b 128 0701.wav 0701_skip_desired_backward.mp3
+
+say -v Anna "Soll wirklich zum Beginn der Datei gewechselt werden? Bestätige innerhalb von 3 Sekunden mit erneutem Druck der Lautstärke Taste!" -o 0702.aiff
+sox 0702.aiff 0702.wav pitch 800
+lame -b 128 0702.wav 0702_skip_desired_restart.mp3
+
+ffmpeg -f lavfi -i anullsrc=r=48000 -t 00:00:10  0703_silence.mp3
+
 say -v Anna "Bitte lege die zu löschende Karte auf! Zum Abbrechen einfach eine der Lautstärke Tasten drücken!" -o 0800.aiff
 sox 0800.aiff 0800.wav pitch 800
 lame -b 128 0800.wav 0800_reset_tag.mp3

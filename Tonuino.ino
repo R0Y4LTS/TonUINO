@@ -1,4 +1,6 @@
-#include <DFMiniMp3.h>
+#include <SimpleTimer.h>
+#include <DFMiniMp3_2_BY8X0116P.h>
+
 #include <EEPROM.h>
 #include <JC_Button.h>
 #include <MFRC522.h>
@@ -21,11 +23,40 @@ struct nfcTagObject {
 
 nfcTagObject myCard;
 
+// Speicherung der Zustände Fast Forward und Fast Rewind
+typedef enum {
+    FFRS_None,
+    FFRS_Forward,
+    FFRS_Rewind,
+
+    FastForRewStatus_Count
+} FastForRewStatus;
+
+FastForRewStatus fastForRewStatus;
+
 static void nextTrack(uint16_t track);
 int voiceMenu(int numberOfOptions, int startMessage, int messageOffset,
               bool preview = false, int previewFromFolder = 0);
 
 bool knownCard = false;
+
+
+const int NO_REWINDING_ZONE_LENGTH = 15000; //Zeitspanne in ms zu Beginn eines Tracks, in der nicht gespult werden darf;
+const int MAX_REWINDING_WITHOUT_STATUS = 1000; // Zeit in ms bis eine Abfrage der aktuellen Position erfolgen muss, entspricht dem 8 fachen an gespulter Zeit
+
+// Konfiguration Skip Protection
+const int MP3_FOLDER_0700_LENGTH = 7000; // Länge in ms des Tracks 0700.mp3 im MP3 Ordner 
+const int SKIP_PROTECTION_CONFIRMATION_TIME = 3000; //Zeit in ms, inder ein weiterer Tatendruck erfolgen muss, damit zum nächsten Track gewechselt wird
+const int SKIP_WITHOUT_CONFIRMATION_WINDOW = 300; //Zeitfenster in s am Anfang eines Tracks, in dem ein Wechseln ohne Nachfrage erfolgt
+SimpleTimer windingTimer; //Timer, für die Statusabfrage beim Rückwärstspulen
+
+typedef enum {
+    SPM_Forward = 0,
+    SPM_Backward,
+    SPM_Restart,
+
+    SkipProtectionMsg_Count
+} SkipProtectionMsg;
 
 // implement a notification class,
 // its member methods will get called
@@ -69,6 +100,15 @@ static DFMiniMp3<SoftwareSerial, Mp3Notify> mp3(mySoftwareSerial);
 // Leider kann das Modul keine Queue abspielen.
 static uint16_t _lastTrackFinished;
 static void nextTrack(uint16_t track) {
+
+  bool outsideWindow;
+  
+  if (fastForRewStatus == FFRS_Forward) {
+    // Beim Vorwärtsspulen wurde das Ende des Tracks erreicht; kein neuer Track
+    fastForRewStatus = FFRS_None;
+    return;    
+  }
+  
   if (track == _lastTrackFinished) {
     return;
    }
@@ -84,74 +124,104 @@ static void nextTrack(uint16_t track) {
 //    mp3.sleep(); // Je nach Modul kommt es nicht mehr zurück aus dem Sleep!
   }
   if (myCard.mode == 2) {
-    if (currentTrack != numTracksInFolder) {
-      currentTrack = currentTrack + 1;
-      mp3.playFolderTrack(myCard.folder, currentTrack);
-      Serial.print(F("Albummodus ist aktiv -> nächster Track: "));
-      Serial.print(currentTrack);
-    } else 
-//      mp3.sleep();   // Je nach Modul kommt es nicht mehr zurück aus dem Sleep!
-    { }
+    if (isSkipDesired(SPM_Forward, outsideWindow) == true) {
+      if (currentTrack != numTracksInFolder) {
+        currentTrack = currentTrack + 1;
+        mp3.playFolderTrack(myCard.folder, currentTrack);
+        Serial.print(F("Albummodus ist aktiv -> nächster Track: "));
+        Serial.print(currentTrack);
+      } else 
+//        mp3.sleep();   // Je nach Modul kommt es nicht mehr zurück aus dem Sleep!
+      { }
+    }
   }
   if (myCard.mode == 3) {
-    uint16_t oldTrack = currentTrack;
-    currentTrack = random(1, numTracksInFolder + 1);
-    if (currentTrack == oldTrack)
-      currentTrack = currentTrack == numTracksInFolder ? 1 : currentTrack+1;
-    Serial.print(F("Party Modus ist aktiv -> zufälligen Track spielen: "));
-    Serial.println(currentTrack);
-    mp3.playFolderTrack(myCard.folder, currentTrack);
+    if (isSkipDesired(SPM_Forward, outsideWindow) == true) {
+      uint16_t oldTrack = currentTrack;
+      currentTrack = random(1, numTracksInFolder + 1);
+      if (currentTrack == oldTrack)
+        currentTrack = currentTrack == numTracksInFolder ? 1 : currentTrack+1;
+      Serial.print(F("Party Modus ist aktiv -> zufälligen Track spielen: "));
+      Serial.println(currentTrack);
+      mp3.playFolderTrack(myCard.folder, currentTrack);
+    }
   }
   if (myCard.mode == 4) {
     Serial.println(F("Einzel Modus aktiv -> Strom sparen"));
 //    mp3.sleep();      // Je nach Modul kommt es nicht mehr zurück aus dem Sleep!
   }
   if (myCard.mode == 5) {
-    if (currentTrack != numTracksInFolder) {
-      currentTrack = currentTrack + 1;
-      Serial.print(F("Hörbuch Modus ist aktiv -> nächster Track und "
-                     "Fortschritt speichern"));
-      Serial.println(currentTrack);
-      mp3.playFolderTrack(myCard.folder, currentTrack);
-      // Fortschritt im EEPROM abspeichern
-      EEPROM.write(myCard.folder, currentTrack);
-    } else {
-//      mp3.sleep();  // Je nach Modul kommt es nicht mehr zurück aus dem Sleep!
-      // Fortschritt zurück setzen
-      EEPROM.write(myCard.folder, 1);
+    if (isSkipDesired(SPM_Forward, outsideWindow) == true) {
+      if (currentTrack != numTracksInFolder) {
+        currentTrack = currentTrack + 1;
+        Serial.print(F("Hörbuch Modus ist aktiv -> nächster Track und "
+                       "Fortschritt speichern"));
+        Serial.println(currentTrack);
+        mp3.playFolderTrack(myCard.folder, currentTrack);
+        // Fortschritt im EEPROM abspeichern
+        EEPROM.write(myCard.folder, currentTrack);
+      } else {
+//        mp3.sleep();  // Je nach Modul kommt es nicht mehr zurück aus dem Sleep!
+        // Fortschritt zurück setzen
+        EEPROM.write(myCard.folder, 1);
+      }
     }
   }
 }
 
 static void previousTrack() {
+  bool outsideWindow;
   if (myCard.mode == 1) {
-    Serial.println(F("Hörspielmodus ist aktiv -> Track von vorne spielen"));
-    mp3.playFolderTrack(myCard.folder, currentTrack);
+    if (isSkipDesired(SPM_Restart, outsideWindow) == true) {
+      Serial.println(F("Hörspielmodus ist aktiv -> Track von vorne spielen"));
+      if (outsideWindow == true) { // Advertisement wurde gespielt und der BY8X0116P hat die Startposition abweichend vom Beginn des unterbrochenen Tracks gespeichert.
+        startMP3FolderTrackAndWaitForPlay(703); // Track mit "Stille" abspielen, damit die gespeicherte Startposition überschrieben wird.
+      }
+      mp3.playFolderTrack(myCard.folder, currentTrack);
+    }
   }
   if (myCard.mode == 2) {
-    Serial.println(F("Albummodus ist aktiv -> vorheriger Track"));
-    if (currentTrack != 1) {
-      currentTrack = currentTrack - 1;
+    if (isSkipDesired(SPM_Backward, outsideWindow) == true) {
+      Serial.println(F("Albummodus ist aktiv -> vorheriger Track"));
+      if (currentTrack != 1) {
+        currentTrack = currentTrack - 1;
+      } else if (outsideWindow == true) { // Advertisement wurde gespielt und der BY8X0116P hat die Startposition abweichend vom Beginn des unterbrochenen Tracks gespeichert.
+        startMP3FolderTrackAndWaitForPlay(703); // Track mit "Stille" abspielen, damit die gespeicherte Startposition überschrieben wird.
+      }
+      mp3.playFolderTrack(myCard.folder, currentTrack);
     }
-    mp3.playFolderTrack(myCard.folder, currentTrack);
   }
   if (myCard.mode == 3) {
-    Serial.println(F("Party Modus ist aktiv -> Track von vorne spielen"));
-    mp3.playFolderTrack(myCard.folder, currentTrack);
+    if (isSkipDesired(SPM_Restart, outsideWindow) == true) {
+      Serial.println(F("Party Modus ist aktiv -> Track von vorne spielen"));
+      if (outsideWindow == true) { // Advertisement wurde gespielt und der BY8X0116P hat die Startposition abweichend vom Beginn des unterbrochenen Tracks gespeichert.
+        startMP3FolderTrackAndWaitForPlay(703); // Track mit "Stille" abspielen, damit die gespeicherte Startposition überschrieben wird.
+      }
+      mp3.playFolderTrack(myCard.folder, currentTrack);
+    }
   }
   if (myCard.mode == 4) {
-    Serial.println(F("Einzel Modus aktiv -> Track von vorne spielen"));
-    mp3.playFolderTrack(myCard.folder, currentTrack);
+    if (isSkipDesired(SPM_Restart, outsideWindow) == true) {
+      Serial.println(F("Einzel Modus aktiv -> Track von vorne spielen"));
+      if (outsideWindow == true) { // Advertisement wurde gespielt und der BY8X0116P hat die Startposition abweichend vom Beginn des unterbrochenen Tracks gespeichert.
+        startMP3FolderTrackAndWaitForPlay(703); // Track mit "Stille" abspielen, damit die gespeicherte Startposition überschrieben wird.
+      }
+      mp3.playFolderTrack(myCard.folder, currentTrack);
+    }
   }
   if (myCard.mode == 5) {
-    Serial.println(F("Hörbuch Modus ist aktiv -> vorheriger Track und "
-                     "Fortschritt speichern"));
-    if (currentTrack != 1) {
-      currentTrack = currentTrack - 1;
+    if (isSkipDesired(SPM_Backward, outsideWindow) == true) {
+      Serial.println(F("Hörbuch Modus ist aktiv -> vorheriger Track und "
+                      "Fortschritt speichern"));
+      if (currentTrack != 1) {
+        currentTrack = currentTrack - 1;
+      } else if (outsideWindow == true) { // Advertisement wurde gespielt und der BY8X0116P hat die Startposition abweichend vom Beginn des unterbrochenen Tracks gespeichert.
+        startMP3FolderTrackAndWaitForPlay(703); // Track mit "Stille" abspielen, damit die gespeicherte Startposition überschrieben wird.
+      }
+      mp3.playFolderTrack(myCard.folder, currentTrack);
+      // Fortschritt im EEPROM abspeichern
+      EEPROM.write(myCard.folder, currentTrack);
     }
-    mp3.playFolderTrack(myCard.folder, currentTrack);
-    // Fortschritt im EEPROM abspeichern
-    EEPROM.write(myCard.folder, currentTrack);
   }
 }
 
@@ -182,14 +252,18 @@ bool ignoreDownButton = false;
 
 uint8_t numberOfCards = 0;
 
-bool isPlaying() { return !digitalRead(busyPin); }
+bool isPlaying() { return digitalRead(busyPin); } // changed busy pin logic for BY8X0116P to HIGH active
 
 void setup() {
 
   Serial.begin(115200); // Es gibt ein paar Debug Ausgaben über die serielle
                         // Schnittstelle
   randomSeed(analogRead(A0)); // Zufallsgenerator initialisieren
-
+  Serial.println(F(""));
+  Serial.println(F("TonUINO+ Version 1.0"));
+  Serial.println(F("Timo Schulze"));
+  Serial.println(F(""));
+  Serial.println(F("Basierend auf"));
   Serial.println(F("TonUINO Version 2.0"));
   Serial.println(F("(c) Thorsten Voß"));
 
@@ -201,8 +275,11 @@ void setup() {
   // Busy Pin
   pinMode(busyPin, INPUT);
 
+  fastForRewStatus = FFRS_None;
+  
   // DFPlayer Mini initialisieren
   mp3.begin();
+  mp3.setBusyPin(busyPin);
   mp3.setVolume(15);
 
   // NFC Leser initialisieren
@@ -235,12 +312,29 @@ void loop() {
     upButton.read();
     downButton.read();
 
+    // Prüfen, ob gerade vor- oder zurückgespult wird
+    if (fastForRewStatus != FFRS_None) {
+      switch (fastForRewStatus) {
+        case FFRS_Forward:
+          mp3.getBY8X0116P()->fastForward();
+        break;
+        case FFRS_Rewind:
+          FastRewind(windingTimer, fastForRewStatus);
+        break;
+      }
+    }
+    
     if (pauseButton.wasReleased()) {
       if (ignorePauseButton == false) {
-        if (isPlaying())
-          mp3.pause();
-        else
-          mp3.start();
+        if (fastForRewStatus == FFRS_None) {
+          if (isPlaying()) {
+            mp3.pause();
+          }
+          else
+            mp3.start();
+        } else if (fastForRewStatus != FFRS_None) {
+          fastForRewStatus = FFRS_None;
+        }
       }
       ignorePauseButton = false;
     } else if (pauseButton.pressedFor(LONG_PRESS) &&
@@ -263,9 +357,24 @@ void loop() {
       mp3.increaseVolume();
       ignoreUpButton = true;
     } else if (upButton.wasReleased()) {
-      if (!ignoreUpButton)
-        nextTrack(random(65536));
-      else
+      if (!ignoreUpButton) {
+        if (fastForRewStatus == FFRS_None) {
+          switch(mp3.getBY8X0116P()->getPlaybackStatus()) {
+            case BY8X0116P_PlaybackStatus_Paused:
+              fastForRewStatus = FFRS_Forward;
+              mp3.start();
+            break;
+            case BY8X0116P_PlaybackStatus_Playing:
+              nextTrack(random(65536));
+            break;
+          }
+        } else if (fastForRewStatus == FFRS_Forward) {
+          fastForRewStatus = FFRS_None;
+          mp3.pause();
+        } else if (fastForRewStatus == FFRS_Rewind) {
+          fastForRewStatus = FFRS_Forward;
+        }
+      } else 
         ignoreUpButton = false;
     }
 
@@ -274,9 +383,24 @@ void loop() {
       mp3.decreaseVolume();
       ignoreDownButton = true;
     } else if (downButton.wasReleased()) {
-      if (!ignoreDownButton)
-        previousTrack();
-      else
+      if (!ignoreDownButton) {
+        if (fastForRewStatus == FFRS_None) {
+          switch(mp3.getBY8X0116P()->getPlaybackStatus()) {
+            case BY8X0116P_PlaybackStatus_Paused:
+              StartRewind(windingTimer, fastForRewStatus);
+            break;
+            case BY8X0116P_PlaybackStatus_Playing:
+              previousTrack();
+            break;
+          }
+        } else if (fastForRewStatus == FFRS_Forward) {
+          //fastForRewStatus = FFRS_Rewind;
+          StartRewind(windingTimer, fastForRewStatus);
+        } else if (fastForRewStatus == FFRS_Rewind) {
+          fastForRewStatus = FFRS_None;
+          mp3.pause();
+        }
+      } else
         ignoreDownButton = false;
     }
     // Ende der Buttons
@@ -344,7 +468,7 @@ void loop() {
 }
 
 int voiceMenu(int numberOfOptions, int startMessage, int messageOffset,
-              bool preview = false, int previewFromFolder = 0) {
+              bool preview, int previewFromFolder) {
   int returnValue = 0;
   if (startMessage != 0)
     mp3.playMp3FolderTrack(startMessage);
@@ -362,7 +486,10 @@ int voiceMenu(int numberOfOptions, int startMessage, int messageOffset,
     if (upButton.pressedFor(LONG_PRESS)) {
       returnValue = min(returnValue + 10, numberOfOptions);
       mp3.playMp3FolderTrack(messageOffset + returnValue);
-      delay(1000);
+      // Warten bis Abspielen der Nachricht begonnen hat; Ersatz für delay(1000) beim DFMiniMp3
+      do {
+        delay(10);
+      } while (!isPlaying());
       if (preview) {
         do {
           delay(10);
@@ -377,7 +504,10 @@ int voiceMenu(int numberOfOptions, int startMessage, int messageOffset,
       if (!ignoreUpButton) {
         returnValue = min(returnValue + 1, numberOfOptions);
         mp3.playMp3FolderTrack(messageOffset + returnValue);
-        delay(1000);
+        // Warten bis Abspielen der Nachricht begonnen hat; Ersatz für delay(1000) beim DFMiniMp3
+        do {
+            delay(10);
+         } while (!isPlaying());
         if (preview) {
           do {
             delay(10);
@@ -394,7 +524,10 @@ int voiceMenu(int numberOfOptions, int startMessage, int messageOffset,
     if (downButton.pressedFor(LONG_PRESS)) {
       returnValue = max(returnValue - 10, 1);
       mp3.playMp3FolderTrack(messageOffset + returnValue);
-      delay(1000);
+      // Warten bis Abspielen der Nachricht begonnen hat; Ersatz für delay(1000) beim DFMiniMp3
+      do {
+        delay(10);
+      } while (!isPlaying());
       if (preview) {
         do {
           delay(10);
@@ -409,7 +542,10 @@ int voiceMenu(int numberOfOptions, int startMessage, int messageOffset,
       if (!ignoreDownButton) {
         returnValue = max(returnValue - 1, 1);
         mp3.playMp3FolderTrack(messageOffset + returnValue);
-        delay(1000);
+        // Warten bis Abspielen der Nachricht begonnen hat; Ersatz für delay(1000) beim DFMiniMp3
+        do {
+          delay(10);
+        } while (!isPlaying());
         if (preview) {
           do {
             delay(10);
@@ -450,10 +586,10 @@ void setupCard() {
   Serial.print(F("Neue Karte konfigurieren"));
 
   // Ordner abfragen
-  myCard.folder = voiceMenu(99, 300, 0, true);
+  myCard.folder = voiceMenu(95, 300, 0, true);
 
   // Wiedergabemodus abfragen
-  myCard.mode = voiceMenu(6, 310, 310);
+  myCard.mode = voiceMenu(5, 310, 310); // kein Admin-Menü
 
   // Hörbuchmodus -> Fortschritt im EEPROM auf 1 setzen
   EEPROM.write(myCard.folder,1);
@@ -493,7 +629,7 @@ bool readCard(nfcTagObject *nfcTag) {
     returnValue = false;
     Serial.print(F("PCD_Authenticate() failed: "));
     Serial.println(mfrc522.GetStatusCodeName(status));
-    return;
+    return returnValue;
   }
 
   // Show the whole sector as it currently is
@@ -574,6 +710,84 @@ void writeCard(nfcTagObject nfcTag) {
     mp3.playMp3FolderTrack(400);
   Serial.println();
   delay(100);
+}
+
+void StartRewind(SimpleTimer& timer, FastForRewStatus& status)
+{
+  unsigned long elapsedTime = mp3.getBY8X0116P()->getCurrentTrackElapsedTime() * 1000UL;
+  
+  if (elapsedTime <= NO_REWINDING_ZONE_LENGTH) {
+    mp3.stop();
+    mp3.playFolderTrack(myCard.folder, currentTrack);
+    status = FFRS_None;
+  } else {
+    status = FFRS_Rewind;
+    mp3.start();
+    timer.setInterval(MAX_REWINDING_WITHOUT_STATUS);
+  }
+}
+
+void FastRewind(SimpleTimer& timer, FastForRewStatus& status)
+{
+  if (!timer.isReady()) {
+    mp3.getBY8X0116P()->fastRewind();
+  } else {
+    unsigned long elapsedTime = mp3.getBY8X0116P()->getCurrentTrackElapsedTime() * 1000UL;
+    if (elapsedTime <= NO_REWINDING_ZONE_LENGTH) {
+      mp3.stop();
+      mp3.playFolderTrack(myCard.folder, currentTrack);
+      status = FFRS_None;
+    } else {
+      timer.reset();
+    }
+  }
+}
+
+// Prüft, ob ein Wechseln zum nächsten Track gewünscht ist, sofern wir uns außerhalb des Zeitfenster befinden, in dem zum nächsten Track springen ohne Nachfrage erfolgt.
+// msg [in]: Art der Nachricht.
+// outsideWindow [out]: Abfrage erfolgte außerhalb des Zeitfensters -> somit wurde das Advertisement abgespielt.
+bool isSkipDesired(SkipProtectionMsg msg, bool& outsideWindow) {
+  bool retVal = false;
+  bool buttonPressed = false;
+
+  int elapsedTime = mp3.getBY8X0116P()->getCurrentTrackElapsedTime();
+
+  if (elapsedTime > SKIP_WITHOUT_CONFIRMATION_WINDOW) {
+    outsideWindow = true;
+    mp3.playAdvertisement(700 + msg);
+    SimpleTimer timer(MP3_FOLDER_0700_LENGTH + SKIP_PROTECTION_CONFIRMATION_TIME);
+    do {
+      pauseButton.read();
+      upButton.read();
+      downButton.read();
+      mp3.loop();
+
+      if ( (upButton.wasReleased() && (msg == SPM_Forward)) ||
+           (downButton.wasReleased() && (msg == SPM_Backward || msg == SPM_Restart)) ) {
+        retVal = true;
+        buttonPressed = true;
+      } else if (timer.isReady()) {
+        retVal = false;
+        buttonPressed = true;
+      }
+    } while (buttonPressed == false);
+
+  } else {
+    outsideWindow = false;
+    retVal = true;
+  }
+  return retVal;
+}
+
+// Spielt einen Track aus dem MP3-Ordner ab und kehrt erst zurück, wenn das Abspielen begonnen hat (auf Basis des Busypins).
+// track [in]: ID des Tracks im MP3-Verzeichnis
+void startMP3FolderTrackAndWaitForPlay(uint16_t track)
+{
+  mp3.stop();
+  mp3.playMp3FolderTrack(track);
+  do {
+    delay(10);
+  } while (!isPlaying());
 }
 
 /**
