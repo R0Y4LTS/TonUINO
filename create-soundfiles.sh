@@ -76,7 +76,8 @@ say -v Anna "Soll wirklich zum Beginn der Datei gewechselt werden? Bestätige in
 sox 0702.aiff 0702.wav pitch 800
 lame -b 128 0702.wav 0702_skip_desired_restart.mp3
 
-ffmpeg -f lavfi -i anullsrc=r=48000 -t 00:00:10  0703_silence.mp3
+sox -n -r 16000 -c 1 0703.wav trim 0.0 10.0
+lame -b 128 0703.wav 0703_silence.mp3
 
 say -v Anna "Bitte lege die zu löschende Karte auf! Zum Abbrechen einfach eine der Lautstärke Tasten drücken!" -o 0800.aiff
 sox 0800.aiff 0800.wav pitch 800
