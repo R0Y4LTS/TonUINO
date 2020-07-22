@@ -269,7 +269,7 @@ public:
         
         _audioController->setVolume(volume);
         
-        return count / 2; //Komischerweise wird immer die doppelte Anzahl zurückgegeben
+        return count;
     }
 
     uint16_t getTotalTrackCount()
